@@ -1,0 +1,330 @@
+Security Map:
+
+keycloak is used so next.js doesnt handle secrets and codes since If the next.js
+app would handle secrets, they would be exposed via traffic eg. XSS,logging,MITM,form injection
+while also becoming its own password storage and need for its own phishing defense. 
+keycloak has most of these features built in and taken care of
+
+keycloak also uses SSO for smoother UX, but can be susceptible to attackers 
+and therefore must be enforced with eg MFA(multifactor Authentication), refreshing tokens, and short session 
+
+this app uses
+OIDC(openID connect) Authorization Code flow to delegate login to Keycloak(via SSO), which transfers 
+basic data like email and username with trusted parties eg login via google/apple etc
+
+Code snippet (web/pages/index.js):
+```javascript
+<button
+  onClick={() => signIn("keycloak", { callbackUrl: "/dashboard" })}
+  style={{ padding: "8px 12px" }}
+>
+  Login
+</button>
+```
+
+`prompt=create` to enable self-registration directly through/in Keycloak builtin UI
+
+Code snippet (web/pages/index.js):
+```javascript
+<button
+  onClick={() =>
+    // Keycloak supports initiating registration via prompt=create (Keycloak 26.1+)
+    signIn("keycloak", { callbackUrl: "/dashboard" }, { prompt: "create" })
+  }
+  style={{ padding: "8px 12px" }}
+>
+  Register
+</button>
+```
+
+issues and vulnerability spots with oAuth and OIDC:
+URI's might be too unspecific (wildcards), so hackers can create subdomains
+ to mimic URI and then redirect users to malitious sites
+
+in this app keycloak has a strict redirect URI(in production more specific to assure most safety)
+  - `http://localhost:3000/api/auth/callback/keycloak`
+
+Code snippet (keycloak/realm-export.json):
+```json
+"redirectUris": [
+  "http://localhost:3000/api/auth/callback/keycloak"
+],
+"webOrigins": [
+  "http://localhost:3000"
+]
+```
+
+production must haves:
+avoid "*" since it broadens the URI--> more suspetible to attackers
+review any open redirect endpointslike ?next={empty} parameters
+
+CSRF/session riding:
+malitious sites send tokens on users behalf on sites where they are authenticated
+
+fix/potential issues
+NextAuth builtin CSRF protection + OAuth `state`(unique ID token that is sent and has to 
+come back identical to confirm user) key can be guessed but not stolen(in production) due to https encryption(vs local http)
+
+Provider configured with `checks: ["state", "pkce"]`.
+proof key for code exchange: further security measure, only the user that receives key from app to login 
+and returns it will be authenticated, key is again protected by https, but can be guessed
+-this works for Authorization code (which is enforced further by pkce)
+
+Code snippet (keycloak/realm-export.json):
+```json
+"attributes": {
+  "post.logout.redirect.uris": "http://localhost:3000/",
+  "pkce.code.challenge.method": "S256"
+}
+```
+
+Code snippet (keycloak/realm-export.json):
+```json
+"standardFlowEnabled": true,
+"directAccessGrantsEnabled": false,
+"implicitFlowEnabled": false
+```
+
+Logout redirect abuse:
+
+-If post_logout/login_redirect_uri is not validated, attacker can redirect users to phishing sites after logout
+or not specific which again creates wildcards
+
+-make sure every redirect is defined/validated eg through
+Keycloak that may validate post-logout URIs
+-in this app logout is set to: `http://localhost:3000/`.
+
+Code snippet (web/lib/keycloakLogout.js):
+```javascript
+export async function keycloakLogout({ idToken }) {
+  // Always clear app session first
+  await signOut({ redirect: false });
+
+  const issuer = process.env.NEXT_PUBLIC_KEYCLOAK_ISSUER;
+  const postLogout = `${window.location.origin}/`;
+
+  if (!issuer || !idToken) {
+    window.location.href = postLogout;
+    return;
+  }
+
+  const url = new URL(`${issuer}/protocol/openid-connect/logout`);
+  url.searchParams.set("id_token_hint", idToken);
+  url.searchParams.set("post_logout_redirect_uri", postLogout);
+
+  window.location.href = url.toString();
+}
+```
+
+Code snippet (keycloak/realm-export.json):
+```json
+"attributes": {
+  "post.logout.redirect.uris": "http://localhost:3000/"
+}
+```
+
+Keycloak-side security controls
+
+MFA
+in app:
+- Users must enroll MFA on first login
+- On later logins, OTP code is required from official authenticator apps
+
+how:
+- Realm Required Action `CONFIGURE_TOTP` set as default.
+
+Code snippet (keycloak/realm-export.json):
+```json
+"requiredActions": [
+  {
+    "alias": "CONFIGURE_TOTP",
+    "name": "Configure OTP",
+    "providerId": "CONFIGURE_TOTP",
+    "enabled": true,
+    "defaultAction": true,
+    "priority": 10,
+    "config": {}
+  }
+]
+```
+
+Password policy:
+- Weak passwords → credential stuffing / offline reuse risk.easy to bruteforce
+
+ in app measures-
+  Realm `passwordPolicy` enforces:
+    - length
+    - upper/lower/digit/special
+    - notUsername
+    - password history
+
+Code snippet (keycloak/realm-export.json):
+```json
+"passwordPolicy": "hashIterations and specialChars(1) and upperCase(1) and lowerCase(1) and digits(1) and length(12) and notUsername and passwordHistory(5)"
+```
+
+for production:
+- Add “breached password”/common-password checks if available
+- Use email verification before granting app access
+
+Brute force defenses
+in app measures-
+- Realm brute-force protection is enabled with wait/backoff configuration
+
+Code snippet (keycloak/realm-export.json):
+```json
+"bruteForceProtected": true,
+"permanentLockout": false,
+"maxFailureWaitSeconds": 900,
+"minimumQuickLoginWaitSeconds": 60,
+"waitIncrementSeconds": 60,
+"quickLoginCheckMilliSeconds": 1000,
+"maxDeltaTimeSeconds": 43200,
+"failureFactor": 8
+```
+
+for production
+- Add WAF / edge rate limits.
+- Monitor sign-in anomalies and spam alerts
+
+Next.js/in app layer security:
+
+Token storage:
+
+risky to store tokens in `localStorage` due to XSS(Cross-Site Scripting)→token theft, through malitious injected code 
+in app-
+- NextAuth uses server-managed cookies + JWT (json web strategy)(no localStorage)
+
+Code snippet (web/pages/api/auth/[...nextauth].js):
+```javascript
+export default NextAuth({
+  providers: [
+    KeycloakProvider({
+      clientId: process.env.KEYCLOAK_CLIENT_ID,
+      clientSecret: process.env.KEYCLOAK_CLIENT_SECRET,
+      issuer: "http://localhost:8080/realms/demo",
+      wellKnown: "http://keycloak:8080/realms/demo/.well-known/openid-configuration",
+    })
+  ],
+  secret: process.env.NEXTAUTH_SECRET,
+  session: { strategy: "jwt" },
+  callbacks: {
+    async jwt({ token, account }) {
+      if (account) {
+        token.accessToken = account.access_token;
+        token.idToken = account.id_token;
+        token.refreshToken = account.refresh_token;
+        token.expiresAt = account.expires_at;
+      }
+      return token;
+    },
+    async session({ session, token }) {
+      session.accessToken = token.accessToken;
+      session.idToken = token.idToken;
+      session.expiresAt = token.expiresAt;
+      return session;
+    },
+  },
+});
+```
+
+Security headers
+In app and for production-
+- `X-Frame-Options`(dont let hackers frame your site to expliot it for clickjacking), 
+- `nosniff(dont guess content, accept set content types)`, 
+- `Referrer-Policy`(what info is sent/received with the user if they leave your site), etc. are set
+
+Code snippet (web/next.config.js):
+```javascript
+async headers() {
+  return [
+    {
+      source: "/(.*)",
+      headers: [
+        { key: "X-Frame-Options", value: "DENY" },
+        { key: "X-Content-Type-Options", value: "nosniff" },
+        { key: "Referrer-Policy", value: "no-referrer" },
+        { key: "Permissions-Policy", value: "camera=(), microphone=(), geolocation=(), payment=(), usb=()" },
+        { key: "Cross-Origin-Opener-Policy", value: "same-origin" },
+        { key: "Cross-Origin-Resource-Policy", value: "same-site" },
+      ],
+    },
+  ];
+}
+```
+
+for production-
+- CSP (content security policy) with nonces (avoid inline Scripting)
+- HSTS (always use HTTPS) good vs man in the middle attacks
+
+XSS (cross site scripting) risks (still relevant)
+Even if tokens are not in localStorage, XSS is still serious:
+- account takeover via actions - keycloak config enable csrf protection(triggers built in functions)
+- CSRF token theft if exposed - use https and same site cookies eg res.cookie('session''someValue, {httpOnly: true, secure: true})
+- data exfiltration conntent-security-policy: default-src 'self'
+
+Code snippet (web/pages/dashboard.js):
+```javascript
+export async function getServerSideProps(context) {
+  const session = await getSession(context);
+
+  if (!session) {
+    return {
+      redirect: {
+        destination: "/",
+        permanent: false,
+      },
+    };
+  }
+
+  return {
+    props: { session },
+  };
+}
+```
+
+for production
+- Strict CSP with nonces
+- Avoid `dangerouslySetInnerHTML`
+- Sanitize untrusted HTML
+
+Docker/config risks
+
+Secrets
+risk of commiting .env to git
+
+in app
+- .env is gitignored
+
+Code snippet (.gitignore):
+```
+# secrets
+.env
+
+# Node
+web/node_modules
+web/.next
+web/out
+web/.env.local
+```
+
+for production
+- Docker secrets / Vault / KMS replace current secrets with real and complex ones
+
+pinning:
+- version`:latest` is very unstable so better to set a precise version
+
+Keycloak image in this app is pinned/has specific version
+
+Code snippet (docker-compose.yml):
+```yaml
+keycloak:
+  image: quay.io/keycloak/keycloak:26.4.7
+  command: ["start-dev", "--import-realm", "--http-port=8080"]
+```
+
+Local vs production main changes:
+
+this app uses demo therefore runs on http making it vulnerable,ok for local dev, production has to use https
+in production, hide server url behind eg reverse proxy and DNS to point sites at each other,
+firewall is main player in keeping real server IP hidden

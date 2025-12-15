@@ -1,0 +1,40 @@
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.4.7
+    command: ["start-dev", "--import-realm", "--http-port=8080"]
+    env_file: .env
+    environment:
+      KC_HTTP_ENABLED: "true"
+      KC_HOSTNAME: "http://localhost:8080"
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+      KC_HOSTNAME_STRICT: "false"
+      KC_HOSTNAME_STRICT_HTTPS: "false"
+      KC_HEALTH_ENABLED: "true"
+      KC_LOG_LEVEL: "INFO"
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json:ro
+
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_KEYCLOAK_ISSUER: ${NEXT_PUBLIC_KEYCLOAK_ISSUER}
+        NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL}
+    env_file: .env
+    environment:
+      NODE_ENV: "production"
+      HOSTNAME: "0.0.0.0"
+      PORT: "3000"
+    ports:
+    - "3000:3000"
+
+    # IMPORTANT (local dev simplicity):
+    # Using host networking ensures the Next.js server can reach Keycloak at http://localhost:8080.
+    # This avoids common "issuer/hostname mismatch" OAuth issues in local Docker setups.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - keycloak
